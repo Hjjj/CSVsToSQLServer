@@ -8,6 +8,9 @@ using System.Configuration;
 using ExcelDataReader;
 using System.IO;
 using System.Runtime.InteropServices;
+using Serilog;
+using System.Runtime.CompilerServices;
+using System.Data.SQLite;
 
 namespace CSVsToSQLServer
 {
@@ -15,16 +18,17 @@ namespace CSVsToSQLServer
     {
         static string DEST_TABLE_NAME = ConfigurationManager.AppSettings["DEST_TABLE_NAME"];
         static string XLS_FOLDER = ConfigurationManager.AppSettings["XLS_FOLDER"];
+        static string LOG_FOLDER_PATH = ConfigurationManager.AppSettings["LOG_FOLDER_PATH"];
+        static string QUEUE_DB_FOLDER = ConfigurationManager.AppSettings["QUEUE_DB_FOLDER"];
+        static string QUEUE_DB_PATH = Path.Combine(QUEUE_DB_FOLDER, "queue.db");
+
 
         static void Main(string[] args)
         {
-            //TODO set up logging
-
-            //get a count of the rows in a sql db table
-            int count = GetRowCount($"SELECT COUNT(*) FROM {DEST_TABLE_NAME}");
-
-            //print the count to the console
-            Console.WriteLine("The row count is: " + count);
+            Log.Logger = InitializeLog();
+            ConsoleAndLog("Application started.");
+            InitializeQueueDb();
+            InitializeXlFiles();
 
             //get count of files in the xls folder
             string[] files = System.IO.Directory.GetFiles(XLS_FOLDER, "*.xlsx", System.IO.SearchOption.TopDirectoryOnly);
@@ -40,9 +44,6 @@ namespace CSVsToSQLServer
 
             using (var stream = File.Open(file, FileMode.Open, FileAccess.Read))
             {
-                // Auto-detect format, supports:
-                //  - Binary Excel files (2.0-2003 format; *.xls)
-                //  - OpenXml Excel files (2007 format; *.xlsx, *.xlsb)
                 using (var reader = ExcelReaderFactory.CreateReader(stream))
                 {
                     do
@@ -67,11 +68,13 @@ namespace CSVsToSQLServer
                             string renewByDate = FormatToRenewByDate(reader.GetString((int)Col.RenewByDate));
                             var eCardCode = reader.GetString((int)Col.ECardCode);
                             var fileName = reader.GetString((int)Col.FileName);
+
                             if(!IsValidFileName(fileName))
                             {
-                                //log the error
+                                ConsoleAndLog($"File name is invalid: {fileName}", LogLevel.Error);
                                 continue;
                             }
+
                             fileName = Path.GetFileNameWithoutExtension(fileName);
                             int employeeId = extractEmployeeId(fileName);
                             int employeeCertificatesId = extractEmployeeCertificatesId(fileName);
@@ -111,6 +114,121 @@ IF NOT EXISTS (SELECT 1 FROM {DEST_TABLE_NAME} WHERE EmployeeID = @EmployeeId AN
 
             //readkey to keep the console open  
             Console.ReadKey();
+        }
+
+        private static void InitializeQueueDb()
+        {
+            EnsureFolderExists(QUEUE_DB_FOLDER);
+
+            if (!File.Exists(QUEUE_DB_PATH))
+            {
+                SQLiteConnection.CreateFile(QUEUE_DB_PATH);
+                ConsoleAndLog($"Created SQLite database at: {QUEUE_DB_PATH}");
+
+                using (var connection = new SQLiteConnection($"Data Source={QUEUE_DB_PATH};Version=3;"))
+                {
+                    connection.Open();
+
+                    string createXLSFileWorkQueueTable = @"
+                CREATE TABLE XLSFileWorkQueue (
+                    Id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    FileName TEXT NOT NULL,
+                    Status INTEGER NOT NULL,
+                    Comments TEXT
+                );";
+
+                    string createIndividualRowWorkQueueTable = @"
+                CREATE TABLE IndividualRowWorkQueue (
+                    Id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    FileName TEXT NOT NULL,
+                    Status INTEGER NOT NULL,
+                    Comments TEXT
+                );";
+
+                    using (var command = new SQLiteCommand(createXLSFileWorkQueueTable, connection))
+                    {
+                        command.ExecuteNonQuery();
+                    }
+
+                    using (var command = new SQLiteCommand(createIndividualRowWorkQueueTable, connection))
+                    {
+                        command.ExecuteNonQuery();
+                    }
+
+                    ConsoleAndLog("Created tables: XLSFileWorkQueue and IndividualRowWorkQueue");
+                }
+            }
+            else
+            {
+                ConsoleAndLog("SQLite database already exists.");
+            }
+        }
+
+        private static ILogger InitializeLog()
+        {
+            EnsureFolderExists(LOG_FOLDER_PATH);
+
+            // Configure Serilog
+            return new LoggerConfiguration()
+                .WriteTo.Console()
+                .WriteTo.File(Path.Combine(LOG_FOLDER_PATH, $"Log{DateTime.Now:MM-dd-yyyy-HH-mm-ss}.txt"))
+                .CreateLogger();
+        }
+
+        private static void EnsureFolderExists(string folderPath)
+        {
+            if (!Directory.Exists(folderPath))
+            {
+                Directory.CreateDirectory(folderPath);
+                ConsoleAndLog($"Created directory: {folderPath}");
+            }
+        }
+
+        /// <summary>
+        /// Check for new xl files in the folder, if they exist put a row into the xlsx_files_queue table in a sqlite db
+        /// </summary>
+        /// <exception cref="NotImplementedException"></exception>
+        private static void InitializeXlFiles()
+        {
+            List<string> filePaths = new List<string>();
+            EnsureFolderExists(XLS_FOLDER);
+            filePaths.AddRange(Directory.GetFiles(XLS_FOLDER, "*.xlsx", SearchOption.TopDirectoryOnly));
+
+            if (filePaths.Count == 0)
+            {
+                ConsoleAndLog("No new files to process.", LogLevel.Information);
+            }
+            else
+            {
+                ConsoleAndLog($"Found {filePaths.Count} new files to process.", LogLevel.Information);
+
+            }
+
+        }
+
+        private static void ConsoleAndLog(string message)
+        {
+            ConsoleAndLog(message, LogLevel.Information);
+        }
+
+        private static void ConsoleAndLog(string message, LogLevel level)
+        {
+            Console.WriteLine(message);
+
+            if (level == LogLevel.Error)
+            {
+                Log.Error(message);
+            }
+            else
+            {
+                Log.Information(message);
+            }
+        }
+
+        enum LogLevel
+        {
+            Information,
+            Error
         }
 
         /// <summary>
