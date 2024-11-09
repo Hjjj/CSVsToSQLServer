@@ -11,6 +11,7 @@ using System.Runtime.InteropServices;
 using Serilog;
 using System.Runtime.CompilerServices;
 using System.Data.SQLite;
+using static System.Net.WebRequestMethods;
 
 namespace CSVsToSQLServer
 {
@@ -29,20 +30,41 @@ namespace CSVsToSQLServer
             ConsoleAndLog("Application started.");
             InitializeQueueDb();
             InitializeXlFiles();
+            
+            var xlFiles = InitializeTheWorkQueue();
+            
+            foreach (var xlFile in xlFiles)
+            {
+                ConsoleAndLog($"Processing {xlFile}...");
+                ProcessSpreadSheetRows(xlFile);
+                UpdateWorkQueueComplete(xlFile);
+                ConsoleAndLog($"Finished processing {xlFile}.");
+            }
 
-            //get count of files in the xls folder
-            string[] files = System.IO.Directory.GetFiles(XLS_FOLDER, "*.xlsx", System.IO.SearchOption.TopDirectoryOnly);
-            Console.WriteLine("The file count is: " + files.Length);
+            ConsoleAndLog($"Finished processing ALL files.");
 
-            //open up an xlsx file and loop through the rows
-            string file = files[0];
+            //readkey to keep the console open  
+            Console.ReadKey();
+        }
 
-            //TODO make is pull multiple xlsx files from the folder
-            //TODO make it resilent to repetitive restarts
-            //so a sqlite log of which xlsx files it has already processed
-            //and a sqlite log of which rows it has already processed
+        private static void UpdateWorkQueueComplete(string xlFile)
+        {
+            using (var connection = new SQLiteConnection($"Data Source={QUEUE_DB_PATH};Version=3;"))
+            {
+                connection.Open();
 
-            using (var stream = File.Open(file, FileMode.Open, FileAccess.Read))
+                string updateQuery = "UPDATE XLSFileWorkQueue SET Status = 1 WHERE FileName = @xlFile";
+                using (var command = new SQLiteCommand(updateQuery, connection))
+                {
+                    command.Parameters.AddWithValue("@xlFile", xlFile);
+                    command.ExecuteNonQuery();
+                }
+            }
+        }
+
+        private static void ProcessSpreadSheetRows(string xlsFile)
+        {
+            using (var stream = System.IO.File.Open(xlsFile, FileMode.Open, FileAccess.Read))
             {
                 using (var reader = ExcelReaderFactory.CreateReader(stream))
                 {
@@ -50,77 +72,141 @@ namespace CSVsToSQLServer
                     {
                         while (reader.Read())
                         {
-                            //TODO put all of this into a try catch block
-
-                            var certTitle =  reader.GetString((int)Col.CertTitle);
-                            certTitle = certTitle?.Length > 200 ? certTitle.Substring(0, 200) : certTitle;
-
-                            var fullName = reader.GetString((int)Col.FullName);
-                            fullName = fullName?.Length > 100 ? fullName.Substring(0, 100) : fullName;
-
-                            if (certTitle=="CertTitle" && fullName=="FullName")
+                            try
                             {
-                                //we are in a title row, so skip it.
-                                continue;
-                            }
 
-                            DateTime issueDate = reader.GetDateTime((int)Col.IssueDate);
-                            string renewByDate = FormatToRenewByDate(reader.GetString((int)Col.RenewByDate));
-                            var eCardCode = reader.GetString((int)Col.ECardCode);
-                            var fileName = reader.GetString((int)Col.FileName);
+                                // Validate that all required columns are present and not null
+                                if (reader.FieldCount < 6 ||
+                                    //reader.IsDBNull((int)Col.CertTitle) ||
+                                    reader.IsDBNull((int)Col.FullName) ||
+                                    reader.IsDBNull((int)Col.IssueDate) ||
+                                    reader.IsDBNull((int)Col.RenewByDate) ||
+                                    reader.IsDBNull((int)Col.ECardCode) ||
+                                    reader.IsDBNull((int)Col.FileName))
+                                {
+                                    ConsoleAndLog("Invalid or incomplete data row, skipping.", LogLevel.Error);
 
-                            if(!IsValidFileName(fileName))
-                            {
-                                ConsoleAndLog($"File name is invalid: {fileName}", LogLevel.Error);
-                                continue;
-                            }
+                                    // Display all fields of the current row
+                                    for (int i = 0; i < reader.FieldCount; i++)
+                                    {
+                                        var value = reader.IsDBNull(i) ? "NULL" : reader.GetValue(i).ToString();
+                                        Console.Write($"{value}\t");
+                                    }
+                                    Console.WriteLine();
 
-                            fileName = Path.GetFileNameWithoutExtension(fileName);
-                            int employeeId = extractEmployeeId(fileName);
-                            int employeeCertificatesId = extractEmployeeCertificatesId(fileName);
-                            var OldCertName = extractOldCertName(fileName);
+                                    continue;
+                                }
 
-                            //save the data to the sql server
-                            string connectionString = ConfigurationManager.AppSettings["ConnectionString"];
-                            using (SqlConnection connection = new SqlConnection(connectionString))
-                            {
-                                connection.Open();
-                                using (SqlCommand command = new SqlCommand(
-                                    $@"
+                                var certTitle = string.Empty;
+                                if(!reader.IsDBNull((int)Col.CertTitle))
+                                {
+                                    certTitle = reader.GetString((int)Col.CertTitle);
+                                    certTitle = certTitle?.Length > 200 ? certTitle.Substring(0, 200) : certTitle;
+                                }
+
+                                var fullName = reader.GetString((int)Col.FullName);
+                                fullName = fullName?.Length > 100 ? fullName.Substring(0, 100) : fullName;
+
+                                if (certTitle == "CertTitle" && fullName == "FullName")
+                                {
+                                    // we are in a title row, so skip it.
+                                    continue;
+                                }
+
+                                if (!DateTime.TryParse(reader.GetString((int)Col.IssueDate), out DateTime issueDate))
+                                {
+                                    ConsoleAndLog($"Invalid IssueDate '{reader.GetString((int)Col.IssueDate)}'. {reader.GetString((int)Col.FileName)}", LogLevel.Error);
+                                    continue;
+                                }
+
+                                if (!DateTime.TryParse(reader.GetString((int)Col.RenewByDate), out DateTime rbd))
+                                {
+                                    ConsoleAndLog($"Invalid RenewByDate '{reader.GetString((int)Col.RenewByDate)}'. {reader.GetString((int)Col.FileName)}", LogLevel.Error);
+                                    continue;
+                                }
+
+                                string renewByDate = rbd.ToString("MM/yyyy");
+                                var eCardCode = reader.GetString((int)Col.ECardCode);
+                                var fileName = reader.GetString((int)Col.FileName);
+
+                                if (!IsValidFileName(fileName))
+                                {
+                                    ConsoleAndLog($"File name is invalid: {fileName}", LogLevel.Error);
+                                    continue;
+                                }
+
+                                fileName = Path.GetFileNameWithoutExtension(fileName);
+                                int employeeId = extractEmployeeId(fileName);
+                                int employeeCertificatesId = extractEmployeeCertificatesId(fileName);
+                                var OldCertName = extractOldCertName(fileName);
+
+                                // save the data to the sql server
+                                string connectionString = ConfigurationManager.AppSettings["ConnectionString"];
+                                using (SqlConnection connection = new SqlConnection(connectionString))
+                                {
+                                    connection.Open();
+                                    using (SqlCommand command = new SqlCommand(
+                                        $@"
 IF NOT EXISTS (SELECT 1 FROM {DEST_TABLE_NAME} WHERE EmployeeID = @EmployeeId AND DispositionID = @EmployeeCertificatesId AND OldCertName = @OldCertName)
     BEGIN
         INSERT INTO {DEST_TABLE_NAME} (CertTitle, FullName, IssueDate, RenewByDate, EcardCode, EmployeeID, DispositionID, OldCertName)
         VALUES (@CertTitle, @FullName, @IssueDate, @RenewByDate, @ECardCode, @EmployeeId, @EmployeeCertificatesId, @OldCertName)
     END", connection))
-                                {
-                                    command.Parameters.AddWithValue("@CertTitle", certTitle);
-                                    command.Parameters.AddWithValue("@FullName", fullName);
-                                    command.Parameters.AddWithValue("@IssueDate", issueDate);
-                                    command.Parameters.AddWithValue("@RenewByDate", renewByDate);
-                                    command.Parameters.AddWithValue("@ECardCode", eCardCode);
-                                    command.Parameters.AddWithValue("@EmployeeId", employeeId);
-                                    command.Parameters.AddWithValue("@EmployeeCertificatesId", employeeCertificatesId);
-                                    command.Parameters.AddWithValue("@OldCertName", OldCertName);
+                                    {
+                                        command.Parameters.AddWithValue("@CertTitle", certTitle);
+                                        command.Parameters.AddWithValue("@FullName", fullName);
+                                        command.Parameters.AddWithValue("@IssueDate", issueDate);
+                                        command.Parameters.AddWithValue("@RenewByDate", renewByDate);
+                                        command.Parameters.AddWithValue("@ECardCode", eCardCode);
+                                        command.Parameters.AddWithValue("@EmployeeId", employeeId);
+                                        command.Parameters.AddWithValue("@EmployeeCertificatesId", employeeCertificatesId);
+                                        command.Parameters.AddWithValue("@OldCertName", OldCertName);
 
-                                    command.ExecuteNonQuery();
+                                        command.ExecuteNonQuery();
+                                    }
                                 }
-
+                            }
+                            catch (Exception ex)
+                            {
+                                ConsoleAndLog($"Error processing row: {ex.Message}", LogLevel.Error);
                             }
                         }
-
                     } while (reader.NextResult());
                 }
             }
-
-            //readkey to keep the console open  
-            Console.ReadKey();
         }
 
+
+        private static List<string> InitializeTheWorkQueue()
+        {
+            List<string> pendingFiles = new List<string>();
+
+            using (var connection = new SQLiteConnection($"Data Source={QUEUE_DB_PATH};Version=3;"))
+            {
+                connection.Open();
+
+                string query = "SELECT FileName FROM XLSFileWorkQueue WHERE Status = 0 ORDER BY FileName ASC";
+                using (var command = new SQLiteCommand(query, connection))
+                {
+                    using (var reader = command.ExecuteReader())
+                    {
+                        while (reader.Read())
+                        {
+                            pendingFiles.Add(reader.GetString(0));
+                        }
+                    }
+                }
+            }
+
+            return pendingFiles;
+        }
+
+ 
         private static void InitializeQueueDb()
         {
             EnsureFolderExists(QUEUE_DB_FOLDER);
 
-            if (!File.Exists(QUEUE_DB_PATH))
+            if (!System.IO.File.Exists(QUEUE_DB_PATH))
             {
                 SQLiteConnection.CreateFile(QUEUE_DB_PATH);
                 ConsoleAndLog($"Created SQLite database at: {QUEUE_DB_PATH}");
@@ -190,9 +276,39 @@ IF NOT EXISTS (SELECT 1 FROM {DEST_TABLE_NAME} WHERE EmployeeID = @EmployeeId AN
         /// <exception cref="NotImplementedException"></exception>
         private static void InitializeXlFiles()
         {
+            List<string> handledWorkQueueFiles = new List<string>();
+
+            //get all the rows of the xlsfileworkqueue table
+            using (var connection = new SQLiteConnection($"Data Source={QUEUE_DB_PATH};Version=3;"))
+            {
+                connection.Open();
+
+                string query = "SELECT * FROM XLSFileWorkQueue";
+                using (var command = new SQLiteCommand(query, connection))
+                {
+                    using (var reader = command.ExecuteReader())
+                    {
+                        while (reader.Read())
+                        {
+                            // Process each row
+                            //var id = reader.GetInt32(0);
+                            var fileName = reader.GetString(1);
+                            //var status = reader.GetInt32(2);
+                            //var comments = reader.IsDBNull(3) ? null : reader.GetString(3);
+
+                            handledWorkQueueFiles.Add(fileName);
+                        }
+                    }
+                }
+            }
+
+
             List<string> filePaths = new List<string>();
             EnsureFolderExists(XLS_FOLDER);
             filePaths.AddRange(Directory.GetFiles(XLS_FOLDER, "*.xlsx", SearchOption.TopDirectoryOnly));
+
+            //return only the files that are not in the handledWorkQueueFiles list
+            filePaths = filePaths.Except(handledWorkQueueFiles).ToList();
 
             if (filePaths.Count == 0)
             {
@@ -201,9 +317,41 @@ IF NOT EXISTS (SELECT 1 FROM {DEST_TABLE_NAME} WHERE EmployeeID = @EmployeeId AN
             else
             {
                 ConsoleAndLog($"Found {filePaths.Count} new files to process.", LogLevel.Information);
+                foreach (var filePath in filePaths)
+                {
+                    Console.WriteLine(filePath);
+                }
+
+                Console.WriteLine("Do you want to add these files to the XLS work queue? (y/n)");
+                var response = Console.ReadLine();
+                if (response?.ToLower() == "y")
+                {
+                    using (var connection = new SQLiteConnection($"Data Source={QUEUE_DB_PATH};Version=3;"))
+                    {
+                        connection.Open();
+
+                        foreach (var filePath in filePaths)
+                        {
+                            using (var command = new SQLiteCommand(connection))
+                            {
+                                command.CommandText = "INSERT INTO XLSFileWorkQueue (FileName, Status) VALUES (@FileName, @Status)";
+                                command.Parameters.AddWithValue("@FileName", filePath);
+                                command.Parameters.AddWithValue("@Status", 0);
+                                command.ExecuteNonQuery();
+                            }
+
+                            ConsoleAndLog($"Added {filePath} to the XLSFileWorkQueue table.", LogLevel.Information);
+                        }
+                    }
+
+                }
+                else
+                {
+                    Console.WriteLine("Files not added to the XLS work queue.");
+                    return;
+                }
 
             }
-
         }
 
         private static void ConsoleAndLog(string message)
